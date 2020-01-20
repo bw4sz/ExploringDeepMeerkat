@@ -1,0 +1,190 @@
+---
+title: "Validation"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = F,message = F)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+```
+
+```{r}
+fil<-list.files("/Users/Ben/DeepMeerkat/DeepMeerkat_20180301_145641",pattern="annotations.csv",recursive = T,full.names=T)
+
+myread<-function(x){
+  f<-read.csv(x)
+  f$Video<-str_match(x,"DeepMeerkat_20180301_145641/(\\w+)/annotations.csv")[,2]
+  return(f)
+}
+
+
+dat<-bind_rows(lapply(fil,myread))
+dat<-dat %>% select(Frame,x,y,h,w,label,score,Video)
+```
+
+```{r}
+#Write ground truth to file, it will be useful in the future. make sure there isn't duplicates
+
+truth<-read.csv("/Users/Ben/Dropbox/DeepLearning/GroundTruth.csv")
+
+#Missing frames
+missing<-dat %>% anti_join(truth)%>% arrange(Video,Frame) %>% select(Video,Frame) %>% group_by(Video,Frame) %>% distinct()
+head(missing)
+write.csv(missing,"MissingGroundTruth.csv",row.names = F)
+dat<-merge(dat,truth,by=c("Video","Frame")) 
+
+#If multiple, choose Positive
+
+sortpos<-function(d){
+  if(length(unique(d$label))==2){
+    d<-d %>% filter(label=="Positive")
+  }
+  return(d)
+}
+dat<-dat %>% group_by(Video,Frame) %>% do(sortpos(.))
+dat<-dat %>% group_by(Video,Frame,label) %>% distinct(Video,Frame,.keep_all=TRUE)
+
+dat %>% group_by(Video,Frame) %>% summarize(n=n()) %>% filter(n>1)
+
+```
+
+# General Statistics
+
+How many videos?
+
+```{r}
+length(fil)
+```
+
+How many frames returned by video?
+```{r}
+dat %>% group_by(Video) %>% summarize(n=n()) %>% arrange(desc(n)) %>% as.data.frame()
+```
+
+How many hummimgbird frames?
+
+```{r}
+dat %>% filter(Truth=="Positive") %>% nrow()
+```
+
+# MotionMeerkat
+
+What percentage of frames were returned? Each video is 21,600 frames long.
+
+```{r}
+dat %>% group_by(Video) %>% summarize(n=n()/21600 * 100) %>% arrange(desc(n))
+
+returned<-dat %>% group_by(Video) %>% summarize(n=n()/21600 * 100) %>% arrange(desc(n))
+returned
+mean(returned$n)
+sd(returned$n)
+```
+
+What percentage of returned frames had hummingbirds?
+
+## Precision
+Overall?
+
+```{r}
+prec<-function(MM){MM[MM$Truth=="Positive","n"]/(MM[MM$Truth=="Positive","n"] + MM[MM$Truth=="Negative","n"]) * 100}
+
+MM<-dat %>% group_by(Video,Truth) %>% summarize(n=n()) %>% group_by(Video) %>% spread(Truth,n,fill = 0) %>% group_by(Video) %>% summarize(prec=Positive/(Negative + Positive) * 100) %>% mutate(prec=round(prec,3))
+MM
+mean(MM$prec)
+sd(MM$prec)
+```
+
+# DeepMeerkat
+
+## Overall
+
+```{r}
+DM<-dat %>% group_by(Truth,label) %>% summarize(n=n()) %>% mutate(newkey=paste(Truth,label,sep="_")) %>% ungroup() %>% select(-Truth,-label) %>% spread(newkey,n,fill=0) %>% summarize(TNR=Negative_Negative/(Negative_Negative + Negative_Positive),recall=Positive_Positive/(Positive_Positive + Positive_Negative),precision=Positive_Positive/(Positive_Positive+Negative_Positive)) %>% mutate(TNR=round(TNR,3)*100,precision=round(precision,3)*100,recall=round(recall,3)*100)
+DM
+```
+
+## Per Video
+
+```{r}
+DM<-dat %>% group_by(Video,Truth,label) %>% summarize(n=n()) %>% mutate(newkey=paste(Truth,label,sep="_")) %>% ungroup() %>% select(-Truth,-label) %>% spread(newkey,n,fill=0) %>% group_by(Video) %>% summarize(TNR=Negative_Negative/(Negative_Negative + Negative_Positive),recall=Positive_Positive/(Positive_Positive + Positive_Negative),precision=Positive_Positive/(Positive_Positive+Negative_Positive)) %>% mutate(TNR=round(TNR,3)*100,precision=round(precision,3)*100,recall=round(recall,3)*100)
+data.frame(DM)
+mean(DM$TNR)
+mean(DM$recall,na.rm=TRUE)
+mean(DM$precision,na.rm=TRUE)
+```
+
+## Events captured?
+
+How many missing frames were within 5 seconds of a positive event? These are the true missed data
+
+```{r}
+findClosest<-function(x){
+  #distance to closest positive
+  x<-x %>% filter(Truth=="Positive")
+  closest<-sapply(x$Frame,function(y){
+    mn<-min(abs(x$Frame[!x$Frame==y]-y)) 
+
+    if(length(mn)==0){
+      return(NA)
+    } else{
+      mn
+    }
+    })
+  return(data.frame(x,closest))
+}
+
+dat %>% group_by(Video) %>% do(findClosest(.)) %>% arrange(Video,Frame) %>% filter(label=="Negative",Truth=="Positive") %>% filter(closest > 5)
+```
+
+#Tradeoffs
+
+```{r}
+dat$Binary<-NULL
+dat$Binary[dat$label=="Positive"]<-dat$score[dat$label=="Positive"]
+dat$Binary[dat$label=="Negative"]<-1-dat$score[dat$label=="Negative"]
+
+gen_dat<-function(threshold){
+  newdat<-dat %>% select(-label) %>% mutate(new_label=Binary>threshold) 
+  newdat$new_label<-as.factor(newdat$new_label)
+  levels(newdat$new_label)<-c("Negative","Positive")
+  
+  out<-newdat %>% group_by(Truth,new_label) %>% summarize(n=n()) %>% mutate(newkey=paste(Truth,new_label,sep="_")) %>% ungroup() %>% select(-Truth,-new_label) %>% spread(newkey,n,fill=0) %>% summarize(TNR=Negative_Negative/(Negative_Negative + Negative_Positive),recall=Positive_Positive/(Positive_Positive + Positive_Negative),precision=Positive_Positive/(Positive_Positive+Negative_Positive)) %>% mutate(TNR=round(TNR,3)*100,precision=round(precision,3)*100,recall=round(recall,3)*100) %>% mutate(Threshold=threshold)
+  return(out)
+}
+
+threshdat<-lapply(seq(0.05,0.95,.05),gen_dat)
+threshdat<-bind_rows(threshdat)
+ggplot(threshdat,aes(x=Threshold)) + geom_point(aes(y=recall))  + geom_line(aes(y=TNR),col="red") + geom_point(aes(y=TNR),col="red") + geom_line(aes(y=recall)) + labs(y="Recall %",x="Acceptance Value") + theme_bw()
+ggsave("Figures/Tradeoff.jpg",height=4,width=7)
+dat %>% group_by(Truth) %>% summarize(n=n()) %>% mutate(n/sum(n))
+```
+
+```{r}
+threshdat
+```
+
+How many total frames were returned
+
+```{r}
+filp<-list.files("/Users/Ben/DeepMeerkat/DeepMeerkat_20180301_145641",pattern="parameters.csv",recursive = T,full.names=T)
+
+readp<-function(x){
+  f<-read.csv(x,header=F)
+  colnames(f)<-c("par","value")
+  out<-data.frame(f,Video=str_match(x,"(\\w+)/parameters.csv")[,2])
+  return(out)
+}
+parfiles<-bind_rows(lapply(filp,readp))
+
+options(scipen = 999)
+parfiles %>% group_by(par) %>% summarize(mean=mean(as.numeric(value))) 
+
+```
